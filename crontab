@@ -1,0 +1,20 @@
+# Edit this file to introduce tasks to be run by supercronic.
+#
+# Each task to run must be defined on a single line
+# indicating the time and the command to run
+#
+# The time fields are: minute (m), hour (h), day of month (dom), month (mon),
+# and day of week (dow). Use '*' for 'any'.
+#
+# Tasks will be started based on supercronic's system
+# notion of time and timezones.
+#
+# Output of the jobs (including errors) will be sent through
+# supercronic's logging (unless redirected).
+#
+# For example, to run a backup at 5 a.m every week:
+# 0 5 * * 1 tar -zcf /var/backups/home.tgz /home/
+#
+# For more information, see the documentation for supercronic.
+#
+# m h  dom mon dow   command

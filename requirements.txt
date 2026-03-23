@@ -1,0 +1,6 @@
+# core infra-runner
+psycopg2-binary==2.9.10
+typer==0.9
+pandas==2.2.3
+requests==2.32
+python-dotenv
