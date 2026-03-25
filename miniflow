@@ -3,7 +3,6 @@
 
 import json
 import os
-import threading
 import re
 import shutil
 import subprocess
@@ -47,34 +46,34 @@ LAYERS = ("bootstrap", "core", "derived", "functions", "seed", "rls")
 USAGE = """\
 Usage:
     # List all available targets
-    python run.py list
+    python miniflow list
 
     # Apply a single DB file (flat or schema-qualified)
-    python run.py db apply <layer> <target>
-    python run.py db apply <layer> <schema>.<target>
+    python miniflow db apply <layer> <target>
+    python miniflow db apply <layer> <schema>.<target>
 
     # CRITICAL targets require --critical to execute
-    python run.py db apply <layer> <target> --critical
+    python miniflow db apply <layer> <target> --critical
 
-    python run.py db dangerous <target> --confirm
+    python miniflow db dangerous <target> --confirm
 
     # Apply an integration script — namespace.target
-    python run.py integrations apply <namespace>.<target>
-    python run.py integrations apply <namespace>.<target> --critical  # if CRITICAL
+    python miniflow integrations apply <namespace>.<target>
+    python miniflow integrations apply <namespace>.<target> --critical  # if CRITICAL
 
     # Run data pipeline jobs — namespace.job
-    python run.py jobs apply <namespace>.<job>
-    python run.py jobs apply <namespace>.<job> --critical  # if CRITICAL
+    python miniflow jobs apply <namespace>.<job>
+    python miniflow jobs apply <namespace>.<job> --critical  # if CRITICAL
 
-    # Validate all run.py commands inside flows/
-    python run.py flows check
+    # Validate all miniflow commands inside flows/
+    python miniflow flows check
 
     # Find targets not referenced in any flow (or a specific flow)
-    python run.py flows unused
-    python run.py flows unused <flow>
+    python miniflow flows unused
+    python miniflow flows unused <flow>
 
     # Run a read-only inspect target — namespace.target
-    python run.py inspect <namespace>.<target>"""
+    python miniflow inspect <namespace>.<target>"""
 
 try:
     from miniflow_config import CRITICAL, ENV_CONSTRAINTS
@@ -197,12 +196,13 @@ def _run_end(status: str, started_at: datetime) -> None:
 def _step(label: str) -> None:
     if VERBOSE >= 1:
         print(f"[STEP] Applying: {label}")
+        print()
 
 
 def _ok(label: str, started_at: datetime) -> None:
     if VERBOSE >= 1:
         ms = int((datetime.now().astimezone() - started_at).total_seconds() * 1000)
-        print(f"[OK] {label} ({ms} ms)")
+        print(f"[OK] {label}")
 
 
 def _error_block(label: str, exc: BaseException) -> None:
@@ -212,39 +212,18 @@ def _error_block(label: str, exc: BaseException) -> None:
     print('='*27)
 
 
-def _stream_process(args: list[str], env) -> int:
-    """Run a subprocess with real-time streaming. Returns exit code.
+def _stream_process(args: list[str], env) -> tuple[int, str]:
+    """Run a subprocess, capture output, return (exit_code, output).
 
-    VERBOSE >= 2: streams both stdout and stderr.
-    VERBOSE >= 1: streams stderr only (stdout suppressed).
+    stdout and stderr are merged in order. Output is stripped of
+    leading/trailing newlines so boundaries can be controlled by the caller.
     """
-    proc = subprocess.Popen(
+    result = subprocess.run(
         args, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
     )
-
-    has_output = [False]
-    first_line_lock = threading.Lock()
-
-    def _drain(src, dest, show: bool) -> None:
-        for line in src:
-            if show:
-                with first_line_lock:
-                    if not has_output[0]:
-                        print("", file=dest, flush=True)  # blank line before first output
-                        has_output[0] = True
-                print(line, end="", file=dest, flush=True)
-
-    t_out = threading.Thread(target=_drain, args=(proc.stdout, sys.stdout, VERBOSE >= 2), daemon=True)
-    t_err = threading.Thread(target=_drain, args=(proc.stderr, sys.stderr, VERBOSE >= 1), daemon=True)
-    t_out.start()
-    t_err.start()
-    t_out.join()
-    t_err.join()
-    if has_output[0]:
-        print(flush=True)  # blank line after last output
-    return proc.wait()
+    return result.returncode, result.stdout.strip("\n")
 
 
 def check_critical(target: str, critical_flag: bool) -> None:
@@ -291,18 +270,27 @@ def _substitute_env_vars(sql: str) -> str:
     return pattern.sub(replace, sql)
 
 
-def _run_sql_file(conn, path: Path) -> None:
+def _run_sql_file(conn, path: Path) -> str:
+    """Execute SQL file and return any notices as a string (empty if none)."""
     with conn.cursor() as cur:
         sql = _substitute_env_vars(path.read_text())
         cur.execute(sql)
     conn.commit()
-    if conn.notices:
-        if VERBOSE >= 2:
-            for notice in conn.notices:
-                print(f"  {notice.strip()}")
-        else:
-            print(f"[NOTICE] {len(conn.notices)} message(s)")
-        conn.notices.clear()
+    if not conn.notices:
+        return ""
+    if VERBOSE >= 2:
+        output = "\n".join(f"  {n.strip()}" for n in conn.notices)
+    else:
+        output = f"[NOTICE] {len(conn.notices)} message(s)"
+    conn.notices.clear()
+    return output
+
+
+def _print_output(output: str) -> None:
+    """Print normalized subprocess/SQL output with exactly one trailing blank line."""
+    if VERBOSE >= 1 and output:
+        print(output)
+        print()
 
 
 #* --- DB commands ---
@@ -372,7 +360,8 @@ def apply(
     status = "success"
     try:
         with _connection() as conn:
-            _run_sql_file(conn, sql_file)
+            output = _run_sql_file(conn, sql_file)
+        _print_output(output)
         _ok(label, started_at)
     except Exception as exc:
         status = "error"
@@ -421,7 +410,8 @@ def dangerous(
     status = "success"
     try:
         with _connection() as conn:
-            _run_sql_file(conn, sql_file)
+            output = _run_sql_file(conn, sql_file)
+        _print_output(output)
         _ok(label, started_at)
     except Exception as exc:
         status = "error"
@@ -444,11 +434,11 @@ def integrations_apply(
     if ctx.args:
         bad = f"{ref} {' '.join(ctx.args)}"
         typer.echo(f"Error: expected format 'namespace.target', got '{bad}'", err=True)
-        typer.echo("Usage: run.py integrations apply <namespace.target>", err=True)
+        typer.echo("Usage: miniflow integrations apply <namespace.target>", err=True)
         raise typer.Exit(1)
     if "." not in ref or ref.startswith(".") or ref.endswith("."):
         typer.echo(f"Error: expected format 'namespace.target', got '{ref}'", err=True)
-        typer.echo("Usage: run.py integrations apply <namespace.target>", err=True)
+        typer.echo("Usage: miniflow integrations apply <namespace.target>", err=True)
         raise typer.Exit(1)
     layer, name = ref.split(".", 1)
 
@@ -473,7 +463,8 @@ def integrations_apply(
     _step(label)
     status = "success"
     try:
-        returncode = _stream_process(["bash", str(script)], os.environ)
+        returncode, output = _stream_process(["bash", str(script)], os.environ)
+        _print_output(output)
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, ["bash", str(script)])
         _ok(label, started_at)
@@ -496,7 +487,7 @@ def jobs_apply(
     """Run a data pipeline job. Format: namespace.job (e.g. geodata.vias_apelidos). CRITICAL targets require --critical."""
     if "." not in ref or ref.startswith(".") or ref.endswith("."):
         typer.echo(f"Error: expected format 'namespace.job', got '{ref}'", err=True)
-        typer.echo("Usage: run.py jobs apply <namespace>.<job>", err=True)
+        typer.echo("Usage: miniflow jobs apply <namespace>.<job>", err=True)
         raise typer.Exit(1)
     namespace, job = ref.split(".", 1)
 
@@ -521,7 +512,8 @@ def jobs_apply(
     _step(label)
     status = "success"
     try:
-        returncode = _stream_process(["bash", str(script)], os.environ)
+        returncode, output = _stream_process(["bash", str(script)], os.environ)
+        _print_output(output)
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, ["bash", str(script)])
         _ok(label, started_at)
@@ -601,7 +593,7 @@ def _validate_db_target(target: str) -> str | None:
 
 @flows_app.command(name="check")
 def flows_check() -> None:
-    """Validate all run.py commands inside the flows/ directory."""
+    """Validate all miniflow commands inside the flows/ directory."""
     flows_path = ROOT / "flows"
     if not flows_path.exists():
         typer.echo("No flows/ directory found.", err=True)
@@ -625,7 +617,7 @@ def flows_check() -> None:
 
             if not stripped or stripped.startswith("#"):
                 continue
-            if not any(p.endswith("run.py") for p in stripped.split()):
+            if not any(p.endswith("miniflow") for p in stripped.split()):
                 continue
             if "<" in stripped and ">" in stripped:
                 errors.append(f"{flow_file.relative_to(ROOT)}:{lineno} → unresolved placeholder in active command: {stripped}")
@@ -635,7 +627,7 @@ def flows_check() -> None:
             ref = f"{flow_file.relative_to(ROOT)}:{lineno}"
 
             # Find index of the token ending with 'run.py'
-            rpy_idx = next((i for i, p in enumerate(parts) if p.endswith("run.py")), None)
+            rpy_idx = next((i for i, p in enumerate(parts) if p.endswith("miniflow")), None)
             if rpy_idx is None:
                 errors.append(f"{ref} → cannot parse command: {stripped}")
                 continue
@@ -830,13 +822,13 @@ def flows_unused(
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if not any(p.endswith("run.py") for p in stripped.split()):
+            if not any(p.endswith("miniflow") for p in stripped.split()):
                 continue
             if "<" in stripped and ">" in stripped:
                 continue  # unresolved placeholder
 
             parts = stripped.split()
-            rpy_idx = next((i for i, p in enumerate(parts) if p.endswith("run.py")), None)
+            rpy_idx = next((i for i, p in enumerate(parts) if p.endswith("miniflow")), None)
             if rpy_idx is None:
                 continue
             cmd = parts[rpy_idx + 1:]
@@ -887,11 +879,11 @@ def inspect_run(
     if ctx.args:
         bad = f"{ref} {' '.join(ctx.args)}"
         typer.echo(f"Error: expected format 'namespace.target', got '{bad}'", err=True)
-        typer.echo("Usage: run.py inspect <namespace.target>", err=True)
+        typer.echo("Usage: miniflow inspect <namespace.target>", err=True)
         raise typer.Exit(1)
     if "." not in ref or ref.startswith(".") or ref.endswith("."):
         typer.echo(f"Error: expected format 'namespace.target', got '{ref}'", err=True)
-        typer.echo("Usage: run.py inspect <namespace.target>", err=True)
+        typer.echo("Usage: miniflow inspect <namespace.target>", err=True)
         raise typer.Exit(1)
     group, name = ref.split(".", 1)
 
@@ -937,6 +929,6 @@ if __name__ == "__main__":
         sys.exit(2)
     except TypeError as e:
         if "make_metavar" in str(e):
-            typer.echo("Error: --help unavailable. Use 'python run.py list' to see available targets.", err=True)
+            typer.echo("Error: --help unavailable. Use 'python miniflow list' to see available targets.", err=True)
             sys.exit(1)
         raise

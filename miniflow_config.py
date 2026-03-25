@@ -5,7 +5,7 @@ This file contains user-editable configuration such as:
 - CRITICAL targets
 - ENV_CONSTRAINTS
 
-Do not modify run.py. All project-specific configuration should live here.
+Do not modify miniflow. All project-specific configuration should live here.
 """
 
 # Targets requiring --critical to execute. Format: "layer.name" or "layer.schema.name".

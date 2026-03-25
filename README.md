@@ -37,7 +37,7 @@ It separates four responsibilities:
 
 | Layer | What it is | Who owns it |
 |---|---|---|
-| **Execution** | `run.py` — executes commands and enforces local constraints | Engine — do not modify |
+| **Execution** | `miniflow` — executes commands and enforces local constraints | Engine — do not modify |
 | **Decision** | `flows/` — defines what to run and in what order | User |
 | **Implementation** | `db/`, `jobs/`, `integrations/` — the actual SQL, scripts, and jobs | User |
 | **Inspection** | `inspect/` — read-only diagnostics and environment inspection | User |
@@ -59,7 +59,7 @@ All decisions must be defined before execution, typically in flows.
 #### Structure
 
 ```
-run.py              # execution engine (do not modify)
+miniflow            # execution engine (do not modify)
 miniflow_config.py  # user-editable configuration (CRITICAL, ENV_CONSTRAINTS)
 crontab             # job schedule with supercronic (standard cron format)
 
@@ -79,7 +79,7 @@ jobs/               # self-contained execution units (namespace-based)
     <job>/
       apply.sh
 
-flows/              # execution order (shell scripts calling run.py)
+flows/              # execution order (shell scripts calling miniflow)
 
 inspect/            # read-only diagnostics (not part of flows or pipelines)
 ```
@@ -104,37 +104,37 @@ The setup process also ensures the scheduler binary (supercronic) is available l
 
 ```bash
 # List all available targets
-python run.py list
+python miniflow list
 
 # Apply a DB file — flat or schema-qualified
-python run.py db apply <layer> <target>
-python run.py db apply <layer> <schema>.<target>   # resolves to db/<layer>/<schema>/<target>.sql
+python miniflow db apply <layer> <target>
+python miniflow db apply <layer> <schema>.<target>   # resolves to db/<layer>/<schema>/<target>.sql
 
 # CRITICAL targets require explicit confirmation
-python run.py db apply <layer> <target> --critical
-python run.py integrations apply <namespace>.<target> --critical
-python run.py jobs apply <namespace>.<job> --critical
+python miniflow db apply <layer> <target> --critical
+python miniflow integrations apply <namespace>.<target> --critical
+python miniflow jobs apply <namespace>.<job> --critical
 
 # Apply an integration script — namespace.target
-python run.py integrations apply <namespace>.<target>
+python miniflow integrations apply <namespace>.<target>
 
 # Run a data pipeline job — namespace.job
-python run.py jobs apply <namespace>.<job>
+python miniflow jobs apply <namespace>.<job>
 
 # Destructive — permanently deletes all data
-python run.py db dangerous <target> --confirm
+python miniflow db dangerous <target> --confirm
 
-# Validate all run.py commands inside flows/
-python run.py flows check
+# Validate all miniflow commands inside flows/
+python miniflow flows check
 
 # Find targets not referenced in any flow
-python run.py flows unused
+python miniflow flows unused
 
 # Find targets not referenced by a specific flow
-python run.py flows unused <flow>
+python miniflow flows unused <flow>
 
 # Run a read-only inspect target — namespace.target
-python run.py inspect <namespace>.<target>
+python miniflow inspect <namespace>.<target>
 ```
 
 ## Core Concepts
@@ -143,7 +143,7 @@ python run.py inspect <namespace>.<target>
 
 The CLI executes **one target at a time**. It does not know about other targets, does not track state, and does not enforce order. The system does not maintain shared execution state between targets.
 
-Flows are the source of truth for execution order. A flow is a shell script in `flows/` that calls `run.py` commands in the correct sequence.
+Flows are the source of truth for execution order. A flow is a shell script in `flows/` that calls `miniflow` commands in the correct sequence.
 
 | Use case | Recommended approach |
 |---|---|
@@ -158,14 +158,14 @@ Miniflow does not enforce execution order at runtime. Order is only defined by h
 There is no `apply-all`. Each target must be run explicitly. A typical fresh setup:
 
 ```
-1. python run.py db apply bootstrap <target>      # repeat for each bootstrap target
-2. python run.py db apply core <target>           # repeat for each core target
-3. python run.py db apply derived <target>        # repeat for each derived target
-4. python run.py db apply functions <target>      # repeat for each function target
-5. python run.py db apply seed <target>           # repeat for each seed target
-6. python run.py db apply rls <target>            # repeat for each rls target
-7. python run.py jobs apply <namespace>.<job>     # repeat for each job
-8. python run.py integrations apply <namespace>.<target> # repeat for each integration target
+1. python miniflow db apply bootstrap <target>      # repeat for each bootstrap target
+2. python miniflow db apply core <target>           # repeat for each core target
+3. python miniflow db apply derived <target>        # repeat for each derived target
+4. python miniflow db apply functions <target>      # repeat for each function target
+5. python miniflow db apply seed <target>           # repeat for each seed target
+6. python miniflow db apply rls <target>            # repeat for each rls target
+7. python miniflow jobs apply <namespace>.<job>     # repeat for each job
+8. python miniflow integrations apply <namespace>.<target> # repeat for each integration target
 ```
 
 Flows are the source of truth for execution order. The sequence above belongs in a flow script under `flows/`.
@@ -176,7 +176,7 @@ The database is **state-based, not migration-based**.
 
 Targets are logical identifiers resolved to SQL files in `db/<layer>/`. They are applied with:
 
-`python run.py db apply <layer> <target>`
+`python miniflow db apply <layer> <target>`
 
 The folder structure defines logical grouping and typical execution order, but Miniflow does not enforce dependencies.
 
@@ -207,7 +207,7 @@ jobs/
 Example:
 
 ```bash
-python run.py jobs apply mynamescapce.myjob
+python miniflow jobs apply mynamescapce.myjob
 ```
 
 - Jobs expose a single entry point (`apply.sh`)
@@ -220,7 +220,7 @@ python run.py jobs apply mynamescapce.myjob
 Integrations are scripts used to configure external systems via APIs.
 
 - Located in `integrations/<namespace>/<target>.sh`
-- Executed with `python run.py integrations apply <namespace>.<target>`
+- Executed with `python miniflow integrations apply <namespace>.<target>`
 - Treated as black boxes — the engine does not inspect their behavior
 - Should be idempotent and define system configuration, not data processing
 
@@ -230,16 +230,16 @@ Use integrations for external system setup, not for database changes (`db/`) or 
 
 Flows define the execution order of operations.
 
-A flow is a shell script in `flows/` that calls `run.py` commands in sequence. They are the source of truth for how infrastructure is applied.
+A flow is a shell script in `flows/` that calls `miniflow` commands in sequence. They are the source of truth for how infrastructure is applied.
 
 Miniflow does not infer or enforce order — flows make all decisions explicit.
 
 ##### Flow validation
 
-`flows check` validates all executable `python run.py` commands inside the `flows/` directory:
+`flows check` validates all executable `python miniflow` commands inside the `flows/` directory:
 
 ```bash
-python run.py flows check
+python miniflow flows check
 ```
 
 It ensures that commands are complete, correctly structured, and ready to run.
@@ -248,8 +248,8 @@ Errors are reported when commands are incomplete, invalid, or contain unresolved
 
 ```
 Found 2 error(s) in flows:
-  - flows/orchestrator-dev.sh:24 → unresolved placeholder in active command: python run.py db dangerous <target> --confirm
-  - flows/orchestrator-dev.sh:25 → invalid integrations command: expected 'integrations apply <namespace.target>': python run.py integrations apply <namespace>
+  - flows/orchestrator-dev.sh:24 → unresolved placeholder in active command: python miniflow db dangerous <target> --confirm
+  - flows/orchestrator-dev.sh:25 → invalid integrations command: expected 'integrations apply <namespace.target>': python miniflow integrations apply <namespace>
 ```
 
 Warnings surface potential violations without blocking execution:
@@ -265,17 +265,17 @@ Exit code is `0` if all flows are valid, `1` otherwise. Warnings do not affect t
 `flows unused` reports targets that exist in the repository but are not referenced in any flow:
 
 ```bash
-python run.py flows unused
+python miniflow flows unused
 ```
 
 To scope the analysis to a single flow:
 
 ```bash
-python run.py flows unused <flow>
+python miniflow flows unused <flow>
 
 # Examples:
-python run.py flows unused orchestrator.sh
-python run.py flows unused flows/orchestrator.sh
+python miniflow flows unused orchestrator.sh
+python miniflow flows unused flows/orchestrator.sh
 ```
 
 Output is grouped by domain:
@@ -289,7 +289,7 @@ Output is grouped by domain:
   ai.legacy_job
 
 [integrations]
-  geoserver.old_config
+  aws.old_config
 ```
 
 Unused targets are not errors — the command is informational only. Use it to find dead weight before removing files.
@@ -299,7 +299,7 @@ Unused targets are not errors — the command is informational only. Use it to f
 `inspect` is a read-only execution domain for diagnostics. It is not part of pipelines or flows.
 
 ```bash
-python run.py inspect <namespace.target>
+python miniflow inspect <namespace.target>
 ```
 
 Files live under `inspect/<namespace>/` and can be `.sql` or `.sh`:
@@ -358,7 +358,7 @@ Output level is controlled automatically based on execution context. There is no
 To suppress output in an interactive session:
 
 ```bash
-VERBOSE=1 python run.py db apply core <schema>.<target>
+VERBOSE=1 python miniflow db apply core <schema>.<target>
 ```
 
 #### Execution logs
@@ -426,7 +426,7 @@ Error: target 'integrations.<namespace>.<target>' is not allowed in environment 
 Allowed environments: ['prod']
 ```
 
-The check runs before any SQL or script is executed. `
+The check runs before any SQL or script is executed.
 
 ## Governance
 
@@ -447,11 +447,11 @@ Anything not listed above is outside the system's responsibility.
 
 #### What not to do
 
-- **Do not modify `run.py`** — it is the execution engine. Configuration belongs in `miniflow_config.py`
+- **Do not modify `miniflow`** — it is the execution engine. Configuration belongs in `miniflow_config.py`
 - **Do not rely on implicit execution order** — Miniflow does not infer or enforce order at runtime
 - **Do not use the CLI for multi-step operations** — use a flow script in `flows/`
 - **Do not create dependencies between jobs** — each job must be independently executable
-- **Flows should not contain business logic** — only orchestration via `run.py` commands
+- **Flows should not contain business logic** — only orchestration via `miniflow` commands
 
 #### Principles
 

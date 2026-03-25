@@ -2,9 +2,9 @@
 
 set -e
 
-python ../run.py db apply bootstrap sample
-python ../run.py integrations apply namespace.hello-world
-python ../run.py jobs apply namespace.job
-python ../run.py inspect namespace.hello-world
-python ../run.py inspect namespace.hello-shell
+python ../miniflow db apply bootstrap sample
+python ../miniflow integrations apply namespace.hello-world
+python ../miniflow jobs apply namespace.job
+python ../miniflow inspect namespace.hello-world
+python ../miniflow inspect namespace.hello-shell
 
