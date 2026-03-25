@@ -127,6 +127,12 @@ python run.py db dangerous <target> --confirm
 # Validate all run.py commands inside flows/
 python run.py flows check
 
+# Find targets not referenced in any flow
+python run.py flows unused
+
+# Find targets not referenced by a specific flow
+python run.py flows unused <flow>
+
 # Run a read-only inspect target — namespace.target
 python run.py inspect <namespace>.<target>
 ```
@@ -253,6 +259,40 @@ Warnings surface potential violations without blocking execution:
 - Layer order regressions that violate expected execution sequence
 
 Exit code is `0` if all flows are valid, `1` otherwise. Warnings do not affect the exit code.
+
+##### Unused targets
+
+`flows unused` reports targets that exist in the repository but are not referenced in any flow:
+
+```bash
+python run.py flows unused
+```
+
+To scope the analysis to a single flow:
+
+```bash
+python run.py flows unused <flow>
+
+# Examples:
+python run.py flows unused orchestrator.sh
+python run.py flows unused flows/orchestrator.sh
+```
+
+Output is grouped by domain:
+
+```
+[db]
+  core.users
+  derived.old_table
+
+[jobs]
+  ai.legacy_job
+
+[integrations]
+  geoserver.old_config
+```
+
+Unused targets are not errors — the command is informational only. Use it to find dead weight before removing files.
 
 #### Inspect
 

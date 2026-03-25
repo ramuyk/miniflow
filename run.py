@@ -69,6 +69,10 @@ Usage:
     # Validate all run.py commands inside flows/
     python run.py flows check
 
+    # Find targets not referenced in any flow (or a specific flow)
+    python run.py flows unused
+    python run.py flows unused <flow>
+
     # Run a read-only inspect target — namespace.target
     python run.py inspect <namespace>.<target>"""
 
@@ -310,6 +314,12 @@ def apply(
     critical: bool = typer.Option(False, "--critical", help="Confirm execution of CRITICAL targets."),
 ) -> None:
     """Apply a single SQL file from the given layer. CRITICAL targets require --critical."""
+    if layer == "dangerous":
+        typer.echo(
+            "Error: 'dangerous' targets must be executed using 'db dangerous <target> --confirm'.",
+            err=True,
+        )
+        raise typer.Exit(1)
     if layer not in LAYERS:
         typer.echo(f"Error: unknown layer '{layer}'. Choose from: {list(LAYERS)}", err=True)
         raise typer.Exit(1)
@@ -379,13 +389,23 @@ def dangerous(
     confirm: bool = typer.Option(False, "--confirm", is_flag=True, help="--confirm is required to execute destructive operations."),
 ) -> None:
     """Execute a dangerous destructive operation. Requires --confirm."""
+    _ = confirm  # kept for Typer to register --confirm; actual check uses sys.argv below
     if not target:
         available = sorted(f.stem for f in (DB_DIR / "dangerous").glob("*.sql"))
         typer.echo(f"Error: missing required argument <target>. Available: {available}", err=True)
         raise typer.Exit(1)
-    # confirm is always False due to Typer/Click 8.1+ bool-option incompatibility; sys.argv is reliable
-    if not confirm and "--confirm" not in sys.argv:
-        typer.echo("WARNING: Destructive operation. Add --confirm to proceed.", err=True)
+    # Only accept --confirm if it appears after "dangerous" in this invocation.
+    # Avoids contamination from global flags or unrelated argv entries.
+    try:
+        danger_idx = sys.argv.index("dangerous")
+        confirmed = "--confirm" in sys.argv[danger_idx:]
+    except ValueError:
+        confirmed = False
+    if not confirmed:
+        typer.echo(
+            "Error: destructive operation requires explicit --confirm flag.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     sql_file = DB_DIR / "dangerous" / f"{target}.sql"
@@ -754,6 +774,106 @@ def flows_check() -> None:
 
     if not warnings:
         typer.echo("All flows are valid.")
+
+
+@flows_app.command(name="unused")
+def flows_unused(
+    flow: Optional[str] = typer.Argument(None, help="Optional flow file to scope the analysis (e.g. orchestrator.sh)"),
+) -> None:
+    """Report targets that exist in the repo but are not referenced in any flow."""
+    flows_path = ROOT / "flows"
+
+    # --- Build available targets ---
+    available: dict[str, set[str]] = {"db": set(), "jobs": set(), "integrations": set()}
+
+    for layer in LAYERS:
+        layer_dir = DB_DIR / layer
+        if not layer_dir.exists():
+            continue
+        for f in layer_dir.glob("*.sql"):
+            available["db"].add(f"{layer}.{f.stem}")
+        for schema_dir in (p for p in layer_dir.iterdir() if p.is_dir()):
+            for f in schema_dir.glob("*.sql"):
+                available["db"].add(f"{layer}.{schema_dir.name}.{f.stem}")
+
+    jobs_path = ROOT / "jobs"
+    if jobs_path.exists():
+        for ns_dir in (p for p in jobs_path.iterdir() if p.is_dir()):
+            for job_dir in (p for p in ns_dir.iterdir() if p.is_dir()):
+                if (job_dir / "apply.sh").exists():
+                    available["jobs"].add(f"jobs.{ns_dir.name}.{job_dir.name}")
+
+    integrations_path = ROOT / "integrations"
+    if integrations_path.exists():
+        for ns_dir in (p for p in integrations_path.iterdir() if p.is_dir()):
+            for f in ns_dir.glob("*.sh"):
+                available["integrations"].add(f"integrations.{ns_dir.name}.{f.stem}")
+
+    # --- Resolve which flow files to parse ---
+    if flow is not None:
+        # Strip leading "flows/" so both "orchestrator.sh" and "flows/orchestrator.sh" work
+        flow_clean = flow.removeprefix("flows/")
+        flow_file_path = flows_path / flow_clean
+        if not flow_file_path.exists():
+            typer.echo(f"Error: flow not found: {flow_file_path}", err=True)
+            raise typer.Exit(1)
+        flow_files: list[Path] = [flow_file_path]
+        typer.echo(f"Unused targets relative to flow: {flow_clean}")
+    else:
+        flow_files = sorted(f for f in flows_path.rglob("*") if f.is_file()) if flows_path.exists() else []
+
+    # --- Parse used targets from flows ---
+    used: set[str] = set()
+
+    for flow_file in flow_files:
+        for line in flow_file.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not any(p.endswith("run.py") for p in stripped.split()):
+                continue
+            if "<" in stripped and ">" in stripped:
+                continue  # unresolved placeholder
+
+            parts = stripped.split()
+            rpy_idx = next((i for i, p in enumerate(parts) if p.endswith("run.py")), None)
+            if rpy_idx is None:
+                continue
+            cmd = parts[rpy_idx + 1:]
+            if len(cmd) < 2:
+                continue
+
+            domain, action = cmd[0], cmd[1]
+
+            if domain == "db" and action == "apply" and len(cmd) >= 4:
+                layer, name = cmd[2], cmd[3]
+                if layer in LAYERS:
+                    used.add(f"{layer}.{name}")
+
+            elif domain == "jobs" and action == "apply" and len(cmd) >= 3:
+                ref = cmd[2]
+                if "." in ref and not ref.startswith(".") and not ref.endswith("."):
+                    ns, job = ref.split(".", 1)
+                    used.add(f"jobs.{ns}.{job}")
+
+            elif domain == "integrations" and action == "apply" and len(cmd) >= 3:
+                ref = cmd[2]
+                if "." in ref and not ref.startswith(".") and not ref.endswith("."):
+                    ns, name = ref.split(".", 1)
+                    used.add(f"integrations.{ns}.{name}")
+
+    # --- Report ---
+    any_unused = False
+    for domain in ("db", "jobs", "integrations"):
+        unused = sorted(available[domain] - used)
+        if unused:
+            any_unused = True
+            typer.echo(f"[{domain}]")
+            for t in unused:
+                typer.echo(f"  {t}")
+
+    if not any_unused:
+        typer.echo("No unused targets found.")
 
 
 # --- Inspect command ---
