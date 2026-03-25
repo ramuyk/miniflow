@@ -2,8 +2,8 @@
 """Infrastructure management CLI. See USAGE constant for full usage."""
 
 import json
-import logging
 import os
+import threading
 import re
 import shutil
 import subprocess
@@ -93,10 +93,6 @@ if _env_file.exists():
         _v = _v.strip().strip('"').strip("'")
         os.environ[_k.strip()] = _v
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
-
 def get_verbose_level() -> int:
     if not sys.stdout.isatty():
         return 1
@@ -111,9 +107,6 @@ def get_verbose_level() -> int:
 
 
 VERBOSE = get_verbose_level()
-logger.info("VERBOSE=%s (interactive=%s)", VERBOSE, sys.stdout.isatty())
-if VERBOSE == 2:
-    print()
 
 app = typer.Typer(name="infra", help="Infrastructure management CLI", invoke_without_command=True)
 db_app = typer.Typer(help="Database operations")
@@ -178,9 +171,76 @@ def check_env_constraint(target: str) -> None:
         raise typer.Exit(1)
 
 
-def _print_command() -> None:
-    if VERBOSE == 2:
-        print(f"> {' '.join(sys.argv[1:])}")
+def _run_start(started_at: datetime) -> None:
+    if VERBOSE < 1:
+        return
+    cmd = " ".join(sys.argv[1:])
+    ts = started_at.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n▶▶▶ RUN START ─────────────────────────────")
+    print(f"Command: {cmd}")
+    print(f"Time:    {ts}")
+
+
+def _run_end(status: str, started_at: datetime) -> None:
+    if VERBOSE < 1:
+        return
+    ms = int((datetime.now().astimezone() - started_at).total_seconds() * 1000)
+    icon, label = ("✔", "SUCCESS") if status == "success" else ("✖", "FAILURE")
+    print(f"\n{icon} {label} ({ms} ms)")
+    print("─" * 40)
+
+
+def _step(label: str) -> None:
+    if VERBOSE >= 1:
+        print(f"[STEP] Applying: {label}")
+
+
+def _ok(label: str, started_at: datetime) -> None:
+    if VERBOSE >= 1:
+        ms = int((datetime.now().astimezone() - started_at).total_seconds() * 1000)
+        print(f"[OK] {label} ({ms} ms)")
+
+
+def _error_block(label: str, exc: BaseException) -> None:
+    print(f"\n{'='*10} ERROR {'='*10}")
+    print(f"Step:   {label}")
+    print(f"Reason: {exc}")
+    print('='*27)
+
+
+def _stream_process(args: list[str], env) -> int:
+    """Run a subprocess with real-time streaming. Returns exit code.
+
+    VERBOSE >= 2: streams both stdout and stderr.
+    VERBOSE >= 1: streams stderr only (stdout suppressed).
+    """
+    proc = subprocess.Popen(
+        args, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+
+    has_output = [False]
+    first_line_lock = threading.Lock()
+
+    def _drain(src, dest, show: bool) -> None:
+        for line in src:
+            if show:
+                with first_line_lock:
+                    if not has_output[0]:
+                        print("", file=dest, flush=True)  # blank line before first output
+                        has_output[0] = True
+                print(line, end="", file=dest, flush=True)
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, sys.stdout, VERBOSE >= 2), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, sys.stderr, VERBOSE >= 1), daemon=True)
+    t_out.start()
+    t_err.start()
+    t_out.join()
+    t_err.join()
+    if has_output[0]:
+        print(flush=True)  # blank line after last output
+    return proc.wait()
 
 
 def check_critical(target: str, critical_flag: bool) -> None:
@@ -206,7 +266,7 @@ def _connection():
         user=os.environ["PGUSER"],
         password=os.environ["PGPASSWORD"],
         dbname=os.environ.get("PGDATABASE", "postgres"),
-        connect_timeout=5,
+        connect_timeout=10,
     )
     try:
         yield conn
@@ -232,9 +292,12 @@ def _run_sql_file(conn, path: Path) -> None:
         sql = _substitute_env_vars(path.read_text())
         cur.execute(sql)
     conn.commit()
-    if VERBOSE == 2:
-        for notice in conn.notices:
-            print(notice)
+    if conn.notices:
+        if VERBOSE >= 2:
+            for notice in conn.notices:
+                print(f"  {notice.strip()}")
+        else:
+            print(f"[NOTICE] {len(conn.notices)} message(s)")
         conn.notices.clear()
 
 
@@ -292,32 +355,36 @@ def apply(
     target = f"{layer}.{name}"
     check_critical(target, critical)
     check_env_constraint(target)
-    _print_command()
-    logger.info("APPLY %s/%s", layer, sql_file.name)
+    label = f"{layer}/{sql_file.name}"
     started_at = datetime.now().astimezone()
+    _run_start(started_at)
+    _step(label)
     status = "success"
     try:
         with _connection() as conn:
             _run_sql_file(conn, sql_file)
-    except Exception:
+        _ok(label, started_at)
+    except Exception as exc:
         status = "error"
+        _error_block(label, exc)
         raise
     finally:
+        _run_end(status, started_at)
         log_execution(f"db apply {layer} {name}", status, started_at, datetime.now().astimezone())
-    logger.info("Done.")
 
 
 @db_app.command()
 def dangerous(
     target: Optional[str] = typer.Argument(None, help="Dangerous operation target (e.g. drop_all)"),
-    confirm: bool = typer.Option(False, "--confirm", help="Required to confirm destructive operation."),
+    confirm: bool = typer.Option(False, "--confirm", is_flag=True, help="--confirm is required to execute destructive operations."),
 ) -> None:
     """Execute a dangerous destructive operation. Requires --confirm."""
     if not target:
         available = sorted(f.stem for f in (DB_DIR / "dangerous").glob("*.sql"))
         typer.echo(f"Error: missing required argument <target>. Available: {available}", err=True)
         raise typer.Exit(1)
-    if not confirm:
+    # confirm is always False due to Typer/Click 8.1+ bool-option incompatibility; sys.argv is reliable
+    if not confirm and "--confirm" not in sys.argv:
         typer.echo("WARNING: Destructive operation. Add --confirm to proceed.", err=True)
         raise typer.Exit(1)
 
@@ -327,19 +394,22 @@ def dangerous(
         typer.echo(f"Error: '{target}' not found. Available: {available}", err=True)
         raise typer.Exit(1)
 
-    _print_command()
-    logger.info("DANGEROUS %s", sql_file.name)
+    label = f"dangerous/{sql_file.name}"
     started_at = datetime.now().astimezone()
+    _run_start(started_at)
+    _step(label)
     status = "success"
     try:
         with _connection() as conn:
             _run_sql_file(conn, sql_file)
-    except Exception:
+        _ok(label, started_at)
+    except Exception as exc:
         status = "error"
+        _error_block(label, exc)
         raise
     finally:
+        _run_end(status, started_at)
         log_execution(f"db dangerous {target.replace('.', ' ')}", status, started_at, datetime.now().astimezone())
-    logger.info("Done.")
 
 
 #* --- Integrations commands ---
@@ -377,23 +447,22 @@ def integrations_apply(
     target = f"integrations.{layer}.{name}"
     check_critical(target, critical)
     check_env_constraint(target)
-    _print_command()
+    label = f"integrations/{layer}/{script.name}"
     started_at = datetime.now().astimezone()
+    _run_start(started_at)
+    _step(label)
     status = "success"
     try:
-        result = subprocess.run(["bash", str(script)], env=os.environ, capture_output=(VERBOSE == 2), text=True)
-        if VERBOSE == 2:
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
-        if result.returncode != 0:
-            status = "error"
-            raise subprocess.CalledProcessError(result.returncode, result.args)
-    except Exception:
+        returncode = _stream_process(["bash", str(script)], os.environ)
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, ["bash", str(script)])
+        _ok(label, started_at)
+    except Exception as exc:
         status = "error"
+        _error_block(label, exc)
         raise
     finally:
+        _run_end(status, started_at)
         log_execution(f"integrations apply {layer}.{name}", status, started_at, datetime.now().astimezone())
 
 
@@ -426,23 +495,22 @@ def jobs_apply(
     target = f"jobs.{namespace}.{job}"
     check_critical(target, critical)
     check_env_constraint(target)
-    _print_command()
+    label = f"jobs/{namespace}/{job}/apply.sh"
     started_at = datetime.now().astimezone()
+    _run_start(started_at)
+    _step(label)
     status = "success"
     try:
-        result = subprocess.run(["bash", str(script)], env=os.environ, capture_output=(VERBOSE == 2), text=True)
-        if VERBOSE == 2:
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
-        if result.returncode != 0:
-            status = "error"
-            raise subprocess.CalledProcessError(result.returncode, result.args)
-    except Exception:
+        returncode = _stream_process(["bash", str(script)], os.environ)
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, ["bash", str(script)])
+        _ok(label, started_at)
+    except Exception as exc:
         status = "error"
+        _error_block(label, exc)
         raise
     finally:
+        _run_end(status, started_at)
         log_execution(f"jobs apply {namespace}.{job}", status, started_at, datetime.now().astimezone())
 
 
@@ -724,7 +792,8 @@ def inspect_run(
         typer.echo(f"Error: target not found: {ref}", err=True)
         raise typer.Exit(1)
 
-    _print_command()
+    if VERBOSE >= 1:
+        print(f"[STEP] inspect: {ref}")
     if sql_file.exists():
         if not shutil.which("psql"):
             typer.echo("Error: psql is required to execute SQL files in inspect/", err=True)
